@@ -1,0 +1,891 @@
+#!/bin/bash
+set -euo pipefail
+
+# ═══════════════════════════════════════════════════════════════
+# DOSI Session Launcher v1.0
+# Designed with Narr's constitution: Ground Plane, One Rhythm,
+# Card-as-Tin, Flat Commands, Predictability-as-Trust.
+# ═══════════════════════════════════════════════════════════════
+
+VERSION="1.0"
+PROTOCOL="0.3"
+WSL_DISTRO="${DOSI_WSL_DISTRO:-Ubuntu}"
+SCAN_ROOT="$HOME"
+SCAN_DEPTH=4
+
+# ── Color System (strict — no violations) ─────────────────────
+#
+# ACCENT   — interactive elements only (numbers, prompts, cursor)
+# WHITE    — primary content (names, headings, values)
+# DIM/GRAY — secondary/metadata (paths, timestamps, hints)
+# BOLD     — emphasis (active item, section headers)
+# GREEN    — success/closed/good (status indicators ONLY)
+# RED      — error/open/attention (status indicators ONLY)
+# YELLOW   — warning/pending (status indicators ONLY)
+#
+# Agent names render in DIM. Never in status colors.
+
+ACCENT="\033[36m"     # cyan
+DIM="\033[2m"
+BOLD="\033[1m"
+WHITE="\033[97m"
+GRAY="\033[90m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[91m"
+RESET="\033[0m"
+
+# ── Render Functions (One Rhythm, One Grid) ───────────────────
+#
+# Every command output: Header → Body → Footer
+# Every project line: same printf, same columns
+
+render_header() {
+  local cmd="${1:-}"
+  echo ""
+  if [ -n "$cmd" ]; then
+    echo -e "  ${BOLD}${WHITE}D O S I${RESET}  ${DIM}${cmd}${RESET}"
+  else
+    echo -e "  ${BOLD}${WHITE}D O S I${RESET}  ${DIM}v${VERSION}${RESET}"
+  fi
+  echo ""
+  render_separator
+  echo ""
+}
+
+render_separator() {
+  echo -e "  ${DIM}────────────────────────────────────────────────${RESET}"
+}
+
+render_footer() {
+  local summary="$1"
+  local hint="${2:-}"
+  echo ""
+  render_separator
+  if [ -n "$hint" ]; then
+    echo -e "  ${summary}  ${DIM}${hint}${RESET}"
+  else
+    echo -e "  ${summary}"
+  fi
+  echo ""
+}
+
+render_project_line() {
+  local marker="$1"
+  local num="$2"
+  local sigil="$3"
+  local name="$4"
+  local prefix="$5"
+  local agent="$6"
+  local detail="$7"
+
+  printf "  %b${BOLD}${ACCENT}%s${RESET}  ${WHITE}%s${RESET} %-22s ${GRAY}%-6s${RESET}  ${DIM}%-5s${RESET} %b\n" \
+    "$marker" "$num" "$sigil" "$name" "$prefix" "$agent" "$detail"
+}
+
+render_error() {
+  local what="$1"
+  local why="${2:-}"
+  local fix="${3:-}"
+  echo -e "  ${RED}✗${RESET} ${WHITE}${what}${RESET}"
+  [ -n "$why" ] && echo -e "    ${DIM}${why}${RESET}"
+  [ -n "$fix" ] && echo -e "    ${DIM}${fix}${RESET}"
+}
+
+render_check() {
+  local ok="$1"
+  local label="$2"
+  local detail="${3:-}"
+  if [ "$ok" = "1" ]; then
+    printf "  ${GREEN}✓${RESET} %-16s %b\n" "$label" "$detail"
+  else
+    printf "  ${RED}✗${RESET} %-16s ${RED}%b${RESET}\n" "$label" "$detail"
+  fi
+}
+
+# ── Auto-detection ────────────────────────────────────────────
+
+sigil_for() {
+  local dir="$1"
+  case "$dir" in
+    */orga/*)    echo "◈" ;;
+    */orga)      echo "◈" ;;
+    */orgb/*) echo "◇" ;;
+    */orgb)  echo "◇" ;;
+    */inter/*)   echo "⬡" ;;
+    */inter)     echo "⬡" ;;
+    */dosi)      echo "⏣" ;;
+    */dosi/*)    echo "⏣" ;;
+    "$HOME/HQ"|"$HOME/HQ/"*) echo "◆" ;;
+    *)           echo "○" ;;
+  esac
+}
+
+agent_for() {
+  local dir="$1"
+  case "$dir" in
+    */orga/*)    echo "bree" ;;
+    */orga)      echo "bree" ;;
+    */orgb/*) echo "ant" ;;
+    */orgb)  echo "ant" ;;
+    "$HOME/HQ"|"$HOME/HQ/"*) echo "dosi" ;;
+    *)           echo "dosi" ;;
+  esac
+}
+
+name_for() {
+  local dir="$1"
+  dir="${dir%/}"
+
+  case "$dir" in
+    "$HOME/HQ") echo "Bepely HQ"; return ;;
+    "$HOME/dosi") echo "DOSI Protocol"; return ;;
+  esac
+
+  local basename parent
+  basename=$(basename "$dir")
+  parent=$(basename "$(dirname "$dir")")
+
+  if [ "$basename" = "HQ" ]; then
+    local org
+    org=$(echo "$parent" | sed 's/\b\(.\)/\u\1/g')
+    echo "$org HQ"
+    return
+  fi
+
+  echo "$basename" | sed 's/-/ /g; s/\b\(.\)/\u\1/g'
+}
+
+detect_projects() {
+  NAMES=()
+  DIRS=()
+  PREFIXES=()
+  SIGILS=()
+  AGENTS=()
+
+  local state_files
+  state_files=$(find "$SCAN_ROOT" -maxdepth "$SCAN_DEPTH" -name "STATE.md" \
+    -not -path "*/node_modules/*" \
+    -not -path "*/.git/*" \
+    -not -path "*/.archive/*" \
+    -not -path "*/scaffold/*" \
+    2>/dev/null | sort)
+
+  while IFS= read -r state_file; do
+    [ -z "$state_file" ] && continue
+
+    local state_dir project_dir
+    state_dir=$(dirname "$state_file")
+
+    case "$state_dir" in
+      */dosi) project_dir=$(dirname "$state_dir") ;;
+      */dev)  project_dir=$(dirname "$state_dir") ;;
+      *)      project_dir="$state_dir" ;;
+    esac
+
+    [ ! -d "$project_dir" ] && continue
+
+    local prefix
+    prefix=$(grep -m1 "OCD Prefix:" "$state_file" 2>/dev/null | sed 's/.*\*\*OCD Prefix:\*\* //' | tr -d '`' | xargs)
+    [ -z "$prefix" ] && continue
+
+    local dup=false
+    for d in "${DIRS[@]}"; do
+      [ "$d" = "$project_dir" ] && dup=true && break
+    done
+    $dup && continue
+
+    DIRS+=("$project_dir")
+    NAMES+=("$(name_for "$project_dir")")
+    PREFIXES+=("$prefix")
+    SIGILS+=("$(sigil_for "$project_dir")")
+    AGENTS+=("$(agent_for "$project_dir")")
+  done <<< "$state_files"
+}
+
+# ── State Helpers ─────────────────────────────────────────────
+
+get_control_room() {
+  local dir="$1"
+  if [ -f "$dir/STATE.md" ]; then echo "$dir"
+  elif [ -f "$dir/dosi/STATE.md" ]; then echo "$dir/dosi"
+  elif [ -f "$dir/dev/STATE.md" ]; then echo "$dir/dev"
+  fi
+}
+
+get_last_ocd() {
+  local dir="$1" state=""
+  if [ -f "$dir/STATE.md" ]; then state="$dir/STATE.md"
+  elif [ -f "$dir/dosi/STATE.md" ]; then state="$dir/dosi/STATE.md"
+  elif [ -f "$dir/dev/STATE.md" ]; then state="$dir/dev/STATE.md"
+  fi
+  [ -n "$state" ] && grep -m1 "Last OCD:" "$state" 2>/dev/null | sed 's/.*\*\*Last OCD:\*\* //' | sed 's/ (.*//'
+}
+
+get_last_ocd_number() {
+  local state_file="$1"
+  grep -m1 "Last OCD:" "$state_file" 2>/dev/null | sed 's/.*\*\*Last OCD:\*\* //' | sed 's/ (.*//'
+}
+
+find_ocd_file() {
+  local control_room="$1" ocd_name="$2"
+
+  if [ -f "$control_room/ocd/$ocd_name/$ocd_name.md" ]; then
+    echo "$control_room/ocd/$ocd_name/$ocd_name.md"
+    return
+  fi
+
+  local num
+  num=$(echo "$ocd_name" | grep -oP '\d+$')
+  if [ -n "$num" ]; then
+    local legacy="OCD-$(printf '%03d' "$num")"
+    [ -f "$control_room/ocd/$legacy/$legacy.md" ] && echo "$control_room/ocd/$legacy/$legacy.md" && return
+    legacy="OCD-$num"
+    [ -f "$control_room/ocd/$legacy/$legacy.md" ] && echo "$control_room/ocd/$legacy/$legacy.md" && return
+  fi
+}
+
+is_ocd_open() {
+  local ocd_file="$1"
+  [ ! -f "$ocd_file" ] && return 1
+
+  local closed_line
+  closed_line=$(grep "Closed by" "$ocd_file" 2>/dev/null | head -1)
+
+  if [ -z "$closed_line" ]; then
+    return 0
+  fi
+
+  local value
+  value=$(echo "$closed_line" | sed 's/.*| *\*\*Closed by\*\* *| *//' | sed 's/ *|.*//' | xargs)
+
+  if [ -z "$value" ] || [[ "$value" == *"{"* ]] || [[ "$value" == *"GitHub"* ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Status detail string for a project (● OPEN / ○ closed / – none)
+get_status_detail() {
+  local dir="$1"
+  local cr ocd_name ocd_file last
+
+  cr=$(get_control_room "$dir")
+  [ -z "$cr" ] && echo -e "${RED}no control room${RESET}" && return
+
+  local state_file="$cr/STATE.md"
+  last=$(get_last_ocd_number "$state_file")
+
+  if [ -z "$last" ] || [ "$last" = "—" ]; then
+    echo -e "${DIM}– no sessions${RESET}"
+    return
+  fi
+
+  ocd_file=$(find_ocd_file "$cr" "$last")
+  if [ -z "$ocd_file" ] || [ ! -f "$ocd_file" ]; then
+    echo -e "${YELLOW}${last}${RESET}  ${DIM}(file not found)${RESET}"
+    return
+  fi
+
+  if is_ocd_open "$ocd_file"; then
+    echo -e "${RED}●${RESET} ${WHITE}${last}${RESET}"
+  else
+    echo -e "${GREEN}○${RESET} ${DIM}${last}${RESET}"
+  fi
+}
+
+# ── Close Logic ───────────────────────────────────────────────
+
+close_ocd_file() {
+  local ocd_file="$1" timestamp="$2"
+  sed -i 's/^\*\*Status:\*\* In Progress.*/**Status:** Complete/' "$ocd_file"
+  sed -i "s/| *\*\*Closed by\*\* *|.*/| **Closed by** | Bepely |/" "$ocd_file"
+  sed -i "s/| *\*\*Closed at\*\* *|.*/| **Closed at** | $timestamp |/" "$ocd_file"
+
+  local current_outcome
+  current_outcome=$(grep "\*\*Outcome\*\*" "$ocd_file" 2>/dev/null | sed 's/.*| *\*\*Outcome\*\* *| *//' | sed 's/ *|.*//' | xargs)
+  if [ -z "$current_outcome" ] || [[ "$current_outcome" == *"{"* ]]; then
+    sed -i "s/| *\*\*Outcome\*\* *|.*/| **Outcome** | Session closed via dosi close |/" "$ocd_file"
+  fi
+}
+
+update_state_closed() {
+  local state_file="$1" ocd_name="$2"
+  local current
+  current=$(grep -m1 "Last OCD:" "$state_file" 2>/dev/null)
+  if [[ "$current" != *"complete"* ]] && [[ "$current" != *"Complete"* ]]; then
+    sed -i "s/\(\*\*Last OCD:\*\* $ocd_name\).*/\1 (complete)/" "$state_file"
+  fi
+}
+
+# ── Launch Logic (unified — one function) ─────────────────────
+
+build_wt_tab() {
+  local dir="$1" agent="$2" title="$3" prompt="${4:-}"
+  local claude_cmd="claude --agent $agent"
+  if [ -n "$prompt" ]; then
+    local escaped="${prompt//\'/\'\\\'\'}"
+    claude_cmd="claude --agent $agent '${escaped}'"
+  fi
+  echo "--title \"$title\" -- wsl.exe -d $WSL_DISTRO -- bash -ilc 'cd \"$dir\" && $claude_cmd'"
+}
+
+launch_single() {
+  local idx="$1" prompt="${2:-}"
+  local dir="${DIRS[$idx]}"
+  local agent="${AGENTS[$idx]}"
+  echo ""
+  echo -e "  ${GREEN}${BOLD}${NAMES[$idx]}${RESET} ${DIM}→ $dir${RESET}  ${DIM}agent: ${agent}${RESET}"
+  [ -n "$prompt" ] && echo -e "  ${DIM}prompt: \"$prompt\"${RESET}"
+  echo ""
+  if [ -n "$prompt" ]; then
+    cd "$dir" && exec claude --agent "$agent" "$prompt"
+  else
+    cd "$dir" && exec claude --agent "$agent"
+  fi
+}
+
+launch_tabs() {
+  local prompt="$1"
+  shift
+  local indices=("$@")
+
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Launching ${#indices[@]} session(s)${RESET}"
+  echo ""
+  for idx in "${indices[@]}"; do
+    echo -e "  ${ACCENT}▸${RESET} ${SIGILS[$idx]} ${NAMES[$idx]}  ${DIM}${AGENTS[$idx]}${RESET}  ${GRAY}→ ${DIRS[$idx]}${RESET}"
+  done
+  echo ""
+  render_separator
+  echo -e "  ${BOLD}${WHITE}Windows Terminal Hotkeys${RESET}"
+  echo -e "  ${ACCENT}Ctrl+Tab${RESET}          ${GRAY}│${RESET} Next tab"
+  echo -e "  ${ACCENT}Ctrl+Shift+Tab${RESET}    ${GRAY}│${RESET} Previous tab"
+  echo -e "  ${ACCENT}Ctrl+Alt+${WHITE}<N>${RESET}      ${GRAY}│${RESET} Jump to tab N"
+  echo -e "  ${ACCENT}Ctrl+Shift+W${RESET}      ${GRAY}│${RESET} Close tab"
+  echo -e "  ${ACCENT}Ctrl+Shift+T${RESET}      ${GRAY}│${RESET} New tab"
+  render_separator
+  echo ""
+
+  local wt_cmd="wt.exe"
+  local first=true
+
+  for idx in "${indices[@]}"; do
+    local dir="${DIRS[$idx]}"
+    local agent="${AGENTS[$idx]}"
+    local title="${SIGILS[$idx]} ${NAMES[$idx]} [${agent}]"
+    local tab
+    tab=$(build_wt_tab "$dir" "$agent" "$title" "$prompt")
+
+    if $first; then
+      wt_cmd+=" new-tab $tab"
+      first=false
+    else
+      wt_cmd+=" \\; new-tab $tab"
+    fi
+  done
+
+  eval "$wt_cmd" &
+  disown
+
+  echo -e "  ${GREEN}${BOLD}Sessions launched.${RESET} ${DIM}This window will close in 3s...${RESET}"
+  sleep 3
+}
+
+# ── Commands ──────────────────────────────────────────────────
+
+cmd_scan() {
+  render_header "scan"
+  for i in "${!NAMES[@]}"; do
+    render_project_line "  " "$((i + 1))" "${SIGILS[$i]}" "${NAMES[$i]}" "${PREFIXES[$i]}" "${AGENTS[$i]}" "${DIM}${DIRS[$i]}${RESET}"
+  done
+  render_footer "${DIM}${#NAMES[@]} projects found${RESET}" "scanned ${SCAN_ROOT}, depth ${SCAN_DEPTH}"
+}
+
+cmd_status() {
+  render_header "status"
+  local open_count=0 closed_count=0 none_count=0
+
+  for i in "${!NAMES[@]}"; do
+    local detail
+    detail=$(get_status_detail "${DIRS[$i]}")
+    render_project_line "  " "$((i + 1))" "${SIGILS[$i]}" "${NAMES[$i]}" "${PREFIXES[$i]}" "${AGENTS[$i]}" "$detail"
+
+    # Count for summary
+    if echo -e "$detail" | grep -q "●"; then
+      open_count=$((open_count + 1))
+    elif echo -e "$detail" | grep -q "○"; then
+      closed_count=$((closed_count + 1))
+    else
+      none_count=$((none_count + 1))
+    fi
+  done
+
+  local summary="${DIM}${open_count} open · ${closed_count} closed · ${none_count} no sessions${RESET}"
+  local hint=""
+  [ "$open_count" -gt 0 ] && hint="run ${WHITE}dosi close${DIM} to close all"
+  render_footer "$summary" "$hint"
+}
+
+cmd_close() {
+  local timestamp
+  timestamp=$(date "+%Y-%m-%d %H:%M")
+
+  render_header "close"
+  local closed_count=0
+
+  for i in "${!NAMES[@]}"; do
+    local dir="${DIRS[$i]}"
+    local cr
+    cr=$(get_control_room "$dir")
+    [ -z "$cr" ] && continue
+
+    local state_file="$cr/STATE.md"
+    local last_ocd
+    last_ocd=$(get_last_ocd_number "$state_file")
+    [ -z "$last_ocd" ] || [ "$last_ocd" = "—" ] && continue
+
+    local ocd_file
+    ocd_file=$(find_ocd_file "$cr" "$last_ocd")
+    [ -z "$ocd_file" ] || [ ! -f "$ocd_file" ] && continue
+
+    if is_ocd_open "$ocd_file"; then
+      close_ocd_file "$ocd_file" "$timestamp"
+      update_state_closed "$state_file" "$last_ocd"
+      echo -e "  ${ACCENT}▸${RESET} ${WHITE}${SIGILS[$i]}${RESET} ${NAMES[$i]}  ${GREEN}closed${RESET}  ${DIM}${last_ocd}${RESET}"
+      closed_count=$((closed_count + 1))
+    else
+      echo -e "  ${DIM}  ${SIGILS[$i]} ${NAMES[$i]}  already closed  ${last_ocd}${RESET}"
+    fi
+  done
+
+  if [ "$closed_count" -gt 0 ]; then
+    render_footer "${GREEN}${BOLD}${closed_count} session(s) closed.${RESET}" "timestamp: ${timestamp}"
+  else
+    render_footer "${GREEN}Nothing to close — all sessions already closed.${RESET}"
+  fi
+}
+
+cmd_knowledge() {
+  render_header "knowledge"
+
+  local qdrant_url="${QDRANT_URL:-http://localhost:6333}"
+  local collections=("dosi-core" "knowledge" "knowledge-orgb" "personal-vault")
+  local labels=("Core (foundational)" "Org-A (dev)" "Org-B (dev)" "Personal (vault)")
+  local total_vectors=0
+
+  if ! curl -s "$qdrant_url/collections" > /dev/null 2>&1; then
+    render_error "Qdrant not reachable" "Expected at $qdrant_url" "Start with: docker start qdrant"
+    echo ""
+    exit 1
+  fi
+
+  for i in "${!collections[@]}"; do
+    local col="${collections[$i]}"
+    local label="${labels[$i]}"
+
+    local info
+    info=$(curl -s "$qdrant_url/collections/$col" 2>/dev/null)
+    if [ $? -ne 0 ] || echo "$info" | grep -q '"status":"error"'; then
+      printf "  ${DIM}%-16s${RESET}  ${RED}✗ not found${RESET}  ${DIM}%s${RESET}\n" "$col" "$label"
+      continue
+    fi
+
+    local vectors col_status
+    vectors=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['points_count'])" 2>/dev/null || echo "?")
+    col_status=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['status'])" 2>/dev/null || echo "?")
+
+    local status_icon="${GREEN}●${RESET}"
+    [ "$col_status" != "green" ] && status_icon="${RED}●${RESET}"
+
+    printf "  %-16s  %b ${WHITE}%6s${RESET} vectors  ${DIM}%s${RESET}\n" "$col" "$status_icon" "$vectors" "$label"
+    [ "$vectors" != "?" ] && total_vectors=$((total_vectors + vectors))
+  done
+
+  echo ""
+  render_separator
+
+  # Config status
+  if [ -f "$HOME/.config/dosi/secrets.env" ]; then
+    echo -e "  ${GREEN}●${RESET} secrets.env  ${DIM}~/.config/dosi/secrets.env${RESET}"
+  else
+    echo -e "  ${RED}●${RESET} secrets.env  ${RED}missing${RESET}"
+  fi
+  echo -e "  ${DIM}${total_vectors} total vectors across ${#collections[@]} collections${RESET}"
+  echo ""
+}
+
+cmd_doctor() {
+  render_header "doctor"
+
+  echo -e "  ${BOLD}${WHITE}Runtime${RESET}"
+  local all_ok=true
+
+  # Check tools
+  local tools=("claude" "git" "gh" "python3" "node" "go")
+  for tool in "${tools[@]}"; do
+    if command -v "$tool" > /dev/null 2>&1; then
+      local ver
+      case "$tool" in
+        claude) ver=$(claude --version 2>/dev/null | head -1 || echo "installed") ;;
+        git)    ver=$(git --version 2>/dev/null | sed 's/git version //') ;;
+        gh)     ver=$(gh --version 2>/dev/null | head -1 | sed 's/gh version //' | awk '{print $1}') ;;
+        python3) ver=$(python3 --version 2>/dev/null | sed 's/Python //') ;;
+        node)   ver=$(node --version 2>/dev/null) ;;
+        go)     ver=$(go version 2>/dev/null | awk '{print $3}' | sed 's/go//') ;;
+      esac
+      render_check 1 "$tool" "${DIM}${ver}${RESET}"
+    else
+      render_check 0 "$tool" "not found"
+      all_ok=false
+    fi
+  done
+
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Agents${RESET}"
+  local agent_dir="$HOME/.claude/agents"
+  local agents=("dosi" "bree" "ant")
+  for agent in "${agents[@]}"; do
+    if [ -f "$agent_dir/$agent.md" ]; then
+      render_check 1 "$agent" "${DIM}${agent_dir}/${agent}.md${RESET}"
+    else
+      render_check 0 "$agent" "not found"
+      all_ok=false
+    fi
+  done
+
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Knowledge${RESET}"
+  local qdrant_url="${QDRANT_URL:-http://localhost:6333}"
+  if curl -s "$qdrant_url/collections" > /dev/null 2>&1; then
+    render_check 1 "qdrant" "${DIM}${qdrant_url}${RESET}"
+    local collections=("dosi-core" "knowledge" "knowledge-orgb" "personal-vault")
+    for col in "${collections[@]}"; do
+      local info vectors
+      info=$(curl -s "$qdrant_url/collections/$col" 2>/dev/null)
+      if echo "$info" | grep -q '"status":"error"' 2>/dev/null; then
+        render_check 0 "$col" "not found"
+        all_ok=false
+      else
+        vectors=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['points_count'])" 2>/dev/null || echo "?")
+        render_check 1 "$col" "${DIM}${vectors} vectors${RESET}"
+      fi
+    done
+  else
+    render_check 0 "qdrant" "not reachable at $qdrant_url"
+    all_ok=false
+  fi
+
+  echo ""
+  echo -e "  ${BOLD}${WHITE}Config${RESET}"
+  if [ -f "$HOME/.config/dosi/secrets.env" ]; then
+    render_check 1 "secrets.env" "${DIM}~/.config/dosi/secrets.env${RESET}"
+  else
+    render_check 0 "secrets.env" "missing"
+    all_ok=false
+  fi
+
+  local gpg_key="${DOSI_GPG_KEY:-}"
+  if [ -n "$gpg_key" ] && gpg --list-keys "$gpg_key" > /dev/null 2>&1; then
+    render_check 1 "GPG key" "${DIM}${gpg_key}${RESET}"
+  elif [ -n "$gpg_key" ]; then
+    render_check 0 "GPG key" "not found ($gpg_key)"
+    all_ok=false
+  else
+    render_check 0 "GPG key" "DOSI_GPG_KEY not set"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    render_footer "${GREEN}${BOLD}All checks passed.${RESET}"
+  else
+    render_footer "${YELLOW}Some checks failed.${RESET}" "fix the items marked ✗"
+  fi
+}
+
+cmd_log() {
+  render_header "log"
+  local entries=()
+
+  for i in "${!NAMES[@]}"; do
+    local dir="${DIRS[$i]}"
+    local cr
+    cr=$(get_control_room "$dir")
+    [ -z "$cr" ] && continue
+
+    local index_file="$cr/ocd/INDEX.md"
+    [ ! -f "$index_file" ] && continue
+
+    local sigil="${SIGILS[$i]}"
+    local name="${NAMES[$i]}"
+
+    # Parse table rows from INDEX.md (skip header lines)
+    while IFS= read -r line; do
+      # Match lines like: | PREFIX-OCD-NNN | 2026-03-20 | description | Status | outcomes |
+      if echo "$line" | grep -qP '^\|.*OCD-\d+'; then
+        local ocd_id date focus
+        ocd_id=$(echo "$line" | awk -F'|' '{print $2}' | xargs)
+        date=$(echo "$line" | awk -F'|' '{print $3}' | xargs)
+        focus=$(echo "$line" | awk -F'|' '{print $4}' | xargs)
+        [ -n "$date" ] && [ -n "$ocd_id" ] && entries+=("${date}|${sigil}|${name}|${ocd_id}|${focus}")
+      fi
+    done < "$index_file"
+  done
+
+  if [ ${#entries[@]} -eq 0 ]; then
+    echo -e "  ${DIM}No sessions found across any project.${RESET}"
+    render_footer "${DIM}0 sessions${RESET}"
+    return
+  fi
+
+  # Sort by date descending, show last 15
+  local sorted
+  sorted=$(printf '%s\n' "${entries[@]}" | sort -t'|' -k1 -r | head -15)
+
+  while IFS='|' read -r date sigil name ocd_id focus; do
+    printf "  ${DIM}%s${RESET}  ${WHITE}%-14s${RESET}  %s %-18s  ${DIM}%s${RESET}\n" \
+      "$date" "$ocd_id" "$sigil" "$name" "$focus"
+  done <<< "$sorted"
+
+  local total=${#entries[@]}
+  local orgs
+  orgs=$(printf '%s\n' "${entries[@]}" | awk -F'|' '{print $3}' | sort -u | wc -l)
+  render_footer "${DIM}${total} sessions · ${orgs} projects${RESET}" "showing last 15"
+}
+
+cmd_version() {
+  echo ""
+  echo -e "  ${BOLD}${WHITE}D O S I${RESET}  ${DIM}CLI v${VERSION}${RESET}"
+  echo -e "  ${DIM}Protocol v${PROTOCOL}${RESET}"
+  echo -e "  ${DIM}github.com/Bepely/DOSI${RESET}"
+  echo ""
+}
+
+cmd_help() {
+  render_header "help"
+
+  echo -e "  ${BOLD}${WHITE}Session${RESET}"
+  echo -e "  ${ACCENT}dosi${RESET}                    interactive project menu"
+  echo -e "  ${ACCENT}dosi${RESET} ${WHITE}<N>${RESET}                launch session N"
+  echo -e "  ${ACCENT}dosi${RESET} ${WHITE}<N>${RESET} ${DIM}-m \"prompt\"${RESET}    launch with initial prompt"
+  echo -e "  ${ACCENT}dosi all${RESET}                 launch all sessions as tabs"
+  echo -e "  ${ACCENT}dosi close${RESET}               close all open OCD sessions"
+  echo ""
+
+  echo -e "  ${BOLD}${WHITE}Info${RESET}"
+  echo -e "  ${ACCENT}dosi scan${RESET}                show detected projects"
+  echo -e "  ${ACCENT}dosi status${RESET}              show open/closed OCD status"
+  echo -e "  ${ACCENT}dosi log${RESET}                 cross-project activity timeline"
+  echo ""
+
+  echo -e "  ${BOLD}${WHITE}Knowledge${RESET}"
+  echo -e "  ${ACCENT}dosi knowledge${RESET}           Qdrant collection stats ${DIM}(alias: k)${RESET}"
+  echo ""
+
+  echo -e "  ${BOLD}${WHITE}System${RESET}"
+  echo -e "  ${ACCENT}dosi doctor${RESET}              workstation health check"
+  echo -e "  ${ACCENT}dosi version${RESET}             show CLI and protocol version"
+  echo -e "  ${ACCENT}dosi help${RESET}                this screen"
+  echo -e "  ${ACCENT}dosi completion bash${RESET}     output bash completion script"
+
+  render_footer "${DIM}DOSI v${PROTOCOL}${RESET}" "github.com/Bepely/DOSI"
+}
+
+cmd_completion() {
+  local shell="${1:-bash}"
+  case "$shell" in
+    bash)
+      cat <<'COMP'
+_dosi_completions() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local commands="all scan status close close-all knowledge k doctor log version help completion"
+  if [ "$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=($(compgen -W "$commands 1 2 3 4 5 6 7 8 9 10" -- "$cur"))
+  elif [ "${COMP_WORDS[1]}" = "completion" ]; then
+    COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+  fi
+}
+complete -F _dosi_completions dosi
+COMP
+      ;;
+    *)
+      echo "# Completion for $shell not yet supported. Try: bash"
+      ;;
+  esac
+}
+
+# ── Interactive Mode ──────────────────────────────────────────
+
+show_menu() {
+  clear
+  render_header
+
+  for i in "${!NAMES[@]}"; do
+    local num=$((i + 1))
+    local marker="  "
+    for s in "${selected[@]}"; do
+      if [ "$s" = "$i" ]; then
+        marker="${ACCENT}▸ ${RESET}"
+        break
+      fi
+    done
+
+    local detail
+    detail=$(get_status_detail "${DIRS[$i]}")
+    render_project_line "$marker" "$num" "${SIGILS[$i]}" "${NAMES[$i]}" "${PREFIXES[$i]}" "${AGENTS[$i]}" "$detail"
+  done
+
+  render_footer "${DIM}${#NAMES[@]} projects${RESET}" "enter numbers to select · ${WHITE}a${DIM}=all · ${WHITE}q${DIM}=quit"
+}
+
+interactive_mode() {
+  selected=()
+
+  while true; do
+    show_menu
+    read -p $'  \033[1m→\033[0m ' input
+
+    case "$input" in
+      q|Q) echo ""; exit 0 ;;
+      "")
+        if [ ${#selected[@]} -eq 0 ]; then
+          continue
+        elif [ ${#selected[@]} -eq 1 ]; then
+          launch_single "${selected[0]}"
+          exit 0
+        else
+          launch_tabs "" "${selected[@]}"
+          exit 0
+        fi
+        ;;
+      a|A)
+        selected=("${available[@]}")
+        launch_tabs "" "${selected[@]}"
+        exit 0
+        ;;
+      *)
+        for num in $input; do
+          local idx=$((num - 1))
+          [ "$idx" -lt 0 ] || [ "$idx" -ge "${#NAMES[@]}" ] && continue
+
+          local found=false
+          local new_selected=()
+          for s in "${selected[@]}"; do
+            if [ "$s" = "$idx" ]; then found=true
+            else new_selected+=("$s")
+            fi
+          done
+
+          if $found; then selected=("${new_selected[@]}")
+          else selected+=("$idx")
+          fi
+        done
+        ;;
+    esac
+  done
+}
+
+# ── Main Dispatch ─────────────────────────────────────────────
+
+detect_projects
+
+if [ ${#NAMES[@]} -eq 0 ]; then
+  render_error "No DOSI projects found." \
+    "Scanned ${SCAN_ROOT} (depth ${SCAN_DEPTH}) for STATE.md files with OCD Prefix." \
+    "Run 'dosi help' for setup instructions."
+  echo ""
+  exit 1
+fi
+
+available=()
+for i in "${!NAMES[@]}"; do
+  available+=("$i")
+done
+
+# Extract -m/--message prompt
+LAUNCH_PROMPT=""
+cli_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--message) shift; LAUNCH_PROMPT="${1:-}" ;;
+    *) cli_args+=("$1") ;;
+  esac
+  shift
+done
+set -- "${cli_args[@]}"
+
+# No args → interactive
+[ $# -eq 0 ] && interactive_mode && exit 0
+
+# Command dispatch
+case "$1" in
+  help|--help|-h)       cmd_help; exit 0 ;;
+  version|--version|-v) cmd_version; exit 0 ;;
+  scan)                 cmd_scan; exit 0 ;;
+  status)               cmd_status; exit 0 ;;
+  close|close-all)      cmd_close; exit 0 ;;
+  knowledge|k)          cmd_knowledge; exit 0 ;;
+  doctor)               cmd_doctor; exit 0 ;;
+  log)                  cmd_log; exit 0 ;;
+  completion)           cmd_completion "${2:-bash}"; exit 0 ;;
+  all)
+    local_indices=()
+    for idx in "${available[@]}"; do
+      local_indices+=("$idx")
+    done
+    launch_tabs "$LAUNCH_PROMPT" "${local_indices[@]}"
+    exit 0
+    ;;
+  *)
+    # Parse: dosi <num> [prompt...] <num> [prompt...] ...
+    session_specs=()
+    current_idx=""
+    current_prompt_parts=()
+
+    flush_session() {
+      if [ -n "$current_idx" ]; then
+        local p="${current_prompt_parts[*]}"
+        [ -z "$p" ] && p="$LAUNCH_PROMPT"
+        session_specs+=("${current_idx}:${p}")
+      fi
+      current_idx=""
+      current_prompt_parts=()
+    }
+
+    for arg in "$@"; do
+      if [[ "$arg" =~ ^[0-9]+$ ]]; then
+        flush_session
+        local idx=$((arg - 1))
+        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#NAMES[@]}" ]; then
+          current_idx="$idx"
+        else
+          render_error "Invalid session number: $arg"
+        fi
+      else
+        current_prompt_parts+=("$arg")
+      fi
+    done
+    flush_session
+
+    if [ ${#session_specs[@]} -eq 0 ]; then
+      render_error "Unknown command: $1" "" "Run 'dosi help' for available commands."
+      echo ""
+      exit 1
+    elif [ ${#session_specs[@]} -eq 1 ]; then
+      local spec="${session_specs[0]}"
+      local idx="${spec%%:*}"
+      local prompt="${spec#*:}"
+      launch_single "$idx" "$prompt"
+    else
+      local tab_indices=()
+      for spec in "${session_specs[@]}"; do
+        tab_indices+=("${spec%%:*}")
+      done
+      # Use prompt from first spec or global
+      local first_prompt="${session_specs[0]#*:}"
+      launch_tabs "${first_prompt:-$LAUNCH_PROMPT}" "${tab_indices[@]}"
+    fi
+    exit 0
+    ;;
+esac

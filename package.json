@@ -1,0 +1,24 @@
+{
+  "name": "dosi",
+  "type": "module",
+  "version": "0.3.0",
+  "description": "DOSI — Development Operational Session Instructions. A governance protocol for AI-assisted software development.",
+  "scripts": {
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bepely/dosi.git"
+  },
+  "author": "Bepely (https://github.com/Bepely)",
+  "license": "SEE LICENSE IN LICENSE",
+  "bugs": {
+    "url": "https://github.com/Bepely/dosi/issues"
+  },
+  "homepage": "https://bepely.github.io/dosi/",
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}
